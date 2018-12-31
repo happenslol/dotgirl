@@ -173,13 +173,29 @@ fn get_last(path: &PathBuf) -> Result<String> {
 fn cmd_add(bundle_name: &str, paths: &Vec<PathBuf>) -> Result<()> {
     let mut lockfile = get_lockfile()?;
 
-    // TODO(happens): validate paths
+    let paths = paths
+        .into_iter()
+        .filter(|it| {
+            // TODO(happens): More/better validation
+            // Find out if this is a symlink, we want to skip those
+            let meta = fs::symlink_metadata(&it).expect("Failed to get metadata");
+            if meta.file_type().is_symlink() {
+                println!("skipping {} because it is a symlink.", it.to_str().unwrap());
+                return false;
+            }
+
+            println!("is symlink: {:?}", meta.file_type().is_symlink());
+
+            true
+        })
+        .collect::<Vec<_>>();
+
     let dir = get_bundle_dir(bundle_name, true)?;
     let entries = paths
         .iter()
         .map(|src| {
-            let src = src.clone();
-            let mut dst = dir.clone();
+            let src = src.to_path_buf();
+            let mut dst = dir.to_path_buf();
             let dst_last = get_last(&src)?;
 
             let mut dst_last = String::from(dst_last);
@@ -220,10 +236,7 @@ fn cmd_add(bundle_name: &str, paths: &Vec<PathBuf>) -> Result<()> {
     };
 
     // Save the dotfile for the bundle itself, this has all the paths
-    let dot_meta_path = dir
-        .parent()
-        .expect("Invalid: Dir was just created")
-        .with_file_name("dot.ron");
+    let dot_meta_path = dir.join("dot.ron");
 
     let bundle_ser = ron::ser::to_string(&bundle)?;
     let mut out = File::create(dot_meta_path)?;
@@ -257,7 +270,7 @@ fn cmd_link(bundle_name: &str) -> Result<()> {
         return Err(Error::BundleNotFound);
     }
 
-    let dot_meta_path = dir.with_file_name("dot.ron");
+    let dot_meta_path = dir.join("dot.ron");
     if !dot_meta_path.exists() || !dot_meta_path.is_file() {
         return Err(Error::BundleMissingMeta);
     }
