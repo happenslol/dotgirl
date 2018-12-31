@@ -206,7 +206,7 @@ fn cmd_add(bundle_name: &str, paths: &Vec<PathBuf>) -> Result<()> {
 
             if dst.is_dir() {
                 let mut options = fs_extra::dir::CopyOptions::new();
-                options.copy_inside = true;
+                options.copy_inside = false;
                 options.overwrite = true;
                 fs::create_dir_all(&src)?;
                 fs_extra::dir::copy(&dst, &src, &options)?;
