@@ -145,6 +145,7 @@ fn write_lockfile(lockfile: &Lockfile) -> Result<()> {
 fn get_bundle_dir(name: &str, create: bool) -> Result<PathBuf> {
     let mut path = dirs::home_dir().ok_or(Error::HomedirNotFound)?;
     path.push("dotgirl");
+    path.push("bundle");
     path.push(name);
 
     if create {
@@ -184,8 +185,6 @@ fn cmd_add(bundle_name: &str, paths: &Vec<PathBuf>) -> Result<()> {
                 return false;
             }
 
-            println!("is symlink: {:?}", meta.file_type().is_symlink());
-
             true
         })
         .collect::<Vec<_>>();
@@ -193,26 +192,26 @@ fn cmd_add(bundle_name: &str, paths: &Vec<PathBuf>) -> Result<()> {
     let dir = get_bundle_dir(bundle_name, true)?;
     let entries = paths
         .iter()
-        .map(|src| {
-            let src = src.to_path_buf();
-            let mut dst = dir.to_path_buf();
-            let dst_last = get_last(&src)?;
+        .map(|dst| {
+            let dst = dst.to_path_buf();
 
-            let mut dst_last = String::from(dst_last);
-            if dst_last.starts_with(".") {
-                dst_last.remove(0);
+            let mut src = dir.to_path_buf();
+            let src_last = get_last(&src)?;
+            let mut src_last = String::from(src_last);
+            if src_last.starts_with(".") {
+                src_last.remove(0);
             }
 
-            dst.push(dst_last);
+            src.push(src_last);
 
-            if src.is_dir() {
+            if dst.is_dir() {
                 let mut options = fs_extra::dir::CopyOptions::new();
                 options.copy_inside = true;
                 options.overwrite = true;
-                fs::create_dir_all(&dst)?;
-                fs_extra::dir::copy(&src, &dst, &options)?;
-            } else if src.is_file() {
-                fs::copy(&src, &dst)?;
+                fs::create_dir_all(&src)?;
+                fs_extra::dir::copy(&dst, &src, &options)?;
+            } else if dst.is_file() {
+                fs::copy(&dst, &src)?;
             } else {
                 println!("Does not exist: {:?}", src);
             }
