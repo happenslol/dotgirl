@@ -5,6 +5,7 @@ use std::{
 };
 use clap::{clap_app, AppSettings};
 use serde::{Serialize, Deserialize};
+use dialoguer::{Confirmation, Select, theme};
 
 #[derive(Debug)]
 enum Error {
@@ -49,7 +50,7 @@ struct Bundle {
     entries: Vec<Entry>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Entry {
     src: PathBuf,
     dst: PathBuf,
@@ -127,6 +128,22 @@ fn get_bundle_dir(name: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn get_last(path: &PathBuf) -> Result<String> {
+    let last = path
+        .components()
+        .last()
+        .ok_or(Error::LastComponentInvalid(
+            String::from(path.to_str().unwrap_or(""))
+        ))?
+        .as_os_str()
+        .to_str()
+        .ok_or(Error::LastComponentInvalid(
+            String::from(path.to_str().unwrap_or(""))
+        ))?;
+
+    Ok(String::from(last))
+}
+
 fn add(bundle: &str, paths: &Vec<PathBuf>) -> Result<()> {
     let mut lockfile = get_lockfile()?;
 
@@ -137,17 +154,7 @@ fn add(bundle: &str, paths: &Vec<PathBuf>) -> Result<()> {
         .map(|src| {
             let src = src.clone();
             let mut dst = dir.clone();
-            let dst_last = src
-                .components()
-                .last()
-                .ok_or(Error::LastComponentInvalid(
-                    String::from(src.to_str().unwrap_or(""))
-                ))?
-                .as_os_str()
-                .to_str()
-                .ok_or(Error::LastComponentInvalid(
-                    String::from(src.to_str().unwrap_or(""))
-                ))?;
+            let dst_last = get_last(&src)?;
 
             let mut dst_last = String::from(dst_last);
             if dst_last.starts_with(".") {
@@ -186,19 +193,95 @@ fn add(bundle: &str, paths: &Vec<PathBuf>) -> Result<()> {
         entries,
     };
 
-    link(&bundle);
-    lockfile.push(bundle);
+    // Save the dotfile for the bundle itself, this has all the paths
+    let dot_meta_path = dir
+        .parent()
+        .expect("Invalid: Dir was just created")
+        .with_file_name("dot.ron");
+
+    let bundle_ser = ron::ser::to_string(&bundle)?;
+    let mut out = File::create(dot_meta_path)?;
+    out.write_all(bundle_ser.as_bytes())?;
+
+    // Save the new dotfile, which contains only the paths that have
+    // been linked successfully (which in this case should always be
+    // all of them, but still)
+    let linked = link(&bundle, true)?;
+    lockfile.push(Bundle { entries: linked, ..bundle });
 
     let mut lock_path = get_dir()?;
     lock_path.push("lock.ron");
 
-    let updated = ron::ser::to_string(&lockfile)?;
-    let mut file = File::create(lock_path)?;
-    file.write_all(updated.as_bytes())?;
+    let lockfile_ser = ron::ser::to_string(&lockfile)?;
+    let mut out = File::create(lock_path)?;
+    out.write_all(lockfile_ser.as_bytes())?;
 
     Ok(())
 }
 
-fn link(bundle: &Bundle) {
+fn link(bundle: &Bundle, overwrite: bool) -> Result<Vec<Entry>> {
+    use std::os::unix::fs::symlink;
+
+    let mut result = Vec::new();
+    let mut overwrite_all = overwrite;
+    for it in &bundle.entries {
+        // first, make sure that all dirs leading up to the file
+        // or dir exist (if there is no parent that means we
+        // are placing the file at '/', which is fine
+        if let Some(parent) = it.dst.parent() {
+            // this is weird, but can happen
+            if parent.is_file() {
+                let text = format!(
+                    "You're trying to link the file {}, but {} is a file. {}",
+                    it.dst.display(), parent.display(),
+                    "Do you want to overwrite the file and create a directory instead?",
+                );
+
+                if Confirmation::new()
+                    .with_text(&text)
+                    .default(false)
+                    .interact()
+                    .expect("Failed to show prompt")
+                {
+                    fs::remove_file(parent)?;
+                }
+            }
+
+            if !parent.is_dir() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        if it.dst.exists() {
+            if !overwrite_all {
+                let choices = &["skip", "overwrite", "overwrite all"];
+                let selection = Select::with_theme(&theme::ColorfulTheme::default())
+                    .with_prompt(&format!("{} already exists.", it.dst.display()))
+                    .default(0)
+                    .items(&choices[..])
+                    .interact()
+                    .expect("Failed to show prompt");
+
+                match selection {
+                    0 => continue,
+                    2 => overwrite_all = true,
+                    _ => {},
+                };
+            }
+
+            // if we drop through to here, we're supposed to nuke it and
+            // replace it
+            if it.dst.is_dir() {
+                fs::remove_dir_all(&it.dst)?;
+            } else if it.dst.is_file() {
+                fs::remove_file(&it.dst)?;
+            }
+        }
+
+        symlink(&it.src, &it.dst)?;
+        result.push(it.clone());
+    }
+
+    Ok(result)
 }
 
