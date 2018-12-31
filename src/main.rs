@@ -11,10 +11,12 @@ use dialoguer::{Confirmation, Select, theme};
 enum Error {
     IoError(std::io::Error),
     IoExtraError(fs_extra::error::Error),
-    HomedirNotFoundError,
+    HomedirNotFound,
     ParseError(ron::de::Error),
     SerializeError(ron::ser::Error),
     LastComponentInvalid(String),
+    BundleNotFound,
+    BundleMissingMeta,
 }
 
 impl std::convert::From<fs_extra::error::Error> for Error {
@@ -68,6 +70,10 @@ fn main() -> Result<()> {
             (@arg BUNDLE: +required "bundle name")
             (@arg INPUT: +required ... "input")
         )
+        (@subcommand link =>
+            (about: "link a bundle")
+            (@arg BUNDLE: +required "bundle name")
+        )
     )
         .setting(AppSettings::SubcommandRequiredElseHelp)
         .get_matches();
@@ -83,7 +89,13 @@ fn main() -> Result<()> {
                 .map(|it| it.canonicalize().expect("invalid path"))
                 .collect::<Vec<PathBuf>>();
 
-			add(&bundle, &paths)?;
+			cmd_add(&bundle, &paths)?;
+        },
+        ("link", Some(matches)) => {
+            let bundle = matches.value_of("BUNDLE")
+                .expect("Invalid: BUNDLE is required");
+
+            cmd_link(&bundle)?;
         },
         _ => {},
     };
@@ -92,7 +104,7 @@ fn main() -> Result<()> {
 }
 
 fn get_dir() -> Result<PathBuf> {
-    let mut path = dirs::home_dir().ok_or(Error::HomedirNotFoundError)?;
+    let mut path = dirs::home_dir().ok_or(Error::HomedirNotFound)?;
     path.push("dotgirl");
     fs::create_dir_all(&path)?;
 
@@ -100,7 +112,7 @@ fn get_dir() -> Result<PathBuf> {
 }
 
 fn get_lockfile() -> Result<Lockfile> {
-    let mut path = dirs::home_dir().ok_or(Error::HomedirNotFoundError)?;
+    let mut path = dirs::home_dir().ok_or(Error::HomedirNotFound)?;
     path.push("dotgirl");
 
     if !path.is_dir() {
@@ -119,11 +131,25 @@ fn get_lockfile() -> Result<Lockfile> {
     Ok(parsed)
 }
 
-fn get_bundle_dir(name: &str) -> Result<PathBuf> {
-    let mut path = dirs::home_dir().ok_or(Error::HomedirNotFoundError)?;
+fn write_lockfile(lockfile: &Lockfile) -> Result<()> {
+    let mut lock_path = get_dir()?;
+    lock_path.push("lock.ron");
+
+    let lockfile_ser = ron::ser::to_string(&lockfile)?;
+    let mut out = File::create(lock_path)?;
+    out.write_all(lockfile_ser.as_bytes())?;
+
+    Ok(())
+}
+
+fn get_bundle_dir(name: &str, create: bool) -> Result<PathBuf> {
+    let mut path = dirs::home_dir().ok_or(Error::HomedirNotFound)?;
     path.push("dotgirl");
     path.push(name);
-    fs::create_dir_all(&path)?;
+
+    if create {
+        fs::create_dir_all(&path)?;
+    }
 
     Ok(path)
 }
@@ -144,11 +170,11 @@ fn get_last(path: &PathBuf) -> Result<String> {
     Ok(String::from(last))
 }
 
-fn add(bundle: &str, paths: &Vec<PathBuf>) -> Result<()> {
+fn cmd_add(bundle_name: &str, paths: &Vec<PathBuf>) -> Result<()> {
     let mut lockfile = get_lockfile()?;
 
     // TODO(happens): validate paths
-    let dir = get_bundle_dir(bundle)?;
+    let dir = get_bundle_dir(bundle_name, true)?;
     let entries = paths
         .iter()
         .map(|src| {
@@ -188,7 +214,7 @@ fn add(bundle: &str, paths: &Vec<PathBuf>) -> Result<()> {
         .collect::<Vec<Entry>>();
 
     let bundle = Bundle {
-        id: String::from(bundle),
+        id: String::from(bundle_name),
         author: String::from("me"),
         entries,
     };
@@ -206,24 +232,56 @@ fn add(bundle: &str, paths: &Vec<PathBuf>) -> Result<()> {
     // Save the new dotfile, which contains only the paths that have
     // been linked successfully (which in this case should always be
     // all of them, but still)
-    let linked = link(&bundle, true)?;
+    let linked = link(&bundle, &[], true)?;
     lockfile.push(Bundle { entries: linked, ..bundle });
-
-    let mut lock_path = get_dir()?;
-    lock_path.push("lock.ron");
-
-    let lockfile_ser = ron::ser::to_string(&lockfile)?;
-    let mut out = File::create(lock_path)?;
-    out.write_all(lockfile_ser.as_bytes())?;
+    write_lockfile(&lockfile)?;
 
     Ok(())
 }
 
-fn link(bundle: &Bundle, overwrite: bool) -> Result<Vec<Entry>> {
+fn cmd_link(bundle_name: &str) -> Result<()> {
+    let mut lockfile = get_lockfile()?;
+
+    let maybe_previous = lockfile.iter().find(|it| it.id == bundle_name);
+    let previous_entries = if let Some(previous) = maybe_previous {
+        previous.entries
+            .iter()
+            .map(|it| it.dst.to_str().unwrap())
+            .collect::<Vec<_>>()
+    } else {
+        vec![]
+    };
+
+    let dir = get_bundle_dir(bundle_name, false)?;
+    if !dir.exists() || !dir.is_dir() {
+        return Err(Error::BundleNotFound);
+    }
+
+    let dot_meta_path = dir.with_file_name("dot.ron");
+    if !dot_meta_path.exists() || !dot_meta_path.is_file() {
+        return Err(Error::BundleMissingMeta);
+    }
+
+    let contents = fs::read_to_string(dot_meta_path)?;
+    let bundle = ron::de::from_str::<Bundle>(&contents)?;
+
+    let linked = link(&bundle, &previous_entries[..], false)?;
+    lockfile.retain(|it| it.id != bundle_name);
+    lockfile.push(Bundle { entries: linked, ..bundle });
+    write_lockfile(&lockfile)?;
+
+    Ok(())
+}
+
+fn link(
+    bundle: &Bundle,
+    overwrite: &[&str],
+    overwrite_all: bool
+) -> Result<Vec<Entry>> {
     use std::os::unix::fs::symlink;
 
     let mut result = Vec::new();
-    let mut overwrite_all = overwrite;
+    let mut overwrite_all = overwrite_all;
     for it in &bundle.entries {
         // first, make sure that all dirs leading up to the file
         // or dir exist (if there is no parent that means we
@@ -253,7 +311,7 @@ fn link(bundle: &Bundle, overwrite: bool) -> Result<Vec<Entry>> {
         }
 
         if it.dst.exists() {
-            if !overwrite_all {
+            if !overwrite_all && !overwrite.contains(&it.dst.to_str().unwrap()) {
                 let choices = &["skip", "overwrite", "overwrite all"];
                 let selection = Select::with_theme(&theme::ColorfulTheme::default())
                     .with_prompt(&format!("{} already exists.", it.dst.display()))
