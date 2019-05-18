@@ -1,13 +1,5 @@
 use crate::{Result, Error};
-use std::{fs, path::{Path, PathBuf}};
-
-pub fn is_symlink<P: AsRef<Path>>(path: P) -> Result<bool> {
-    let result = fs::symlink_metadata(path)?
-        .file_type()
-        .is_symlink();
-
-    Ok(result)
-}
+use std::path::PathBuf;
 
 pub fn get_name(path: &PathBuf) -> Result<String> {
     let result = path
@@ -25,10 +17,6 @@ pub fn get_name(path: &PathBuf) -> Result<String> {
         .to_owned();
 
     Ok(result)
-}
-
-pub fn dir_contents_equal() -> Result<bool> {
-    Ok(true)
 }
 
 #[cfg(test)]

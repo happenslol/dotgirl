@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[macro_use]
+extern crate lazy_static;
+
 use std::{
     io::Write,
     fs::{self, File},
@@ -8,6 +12,9 @@ use serde::{Serialize, Deserialize};
 use dialoguer::{Confirmation, Select, theme};
 
 mod util;
+mod disk;
+
+use disk::{Disk, Filesystem as _};
 
 const STORAGE_DIR: &'static str = "dotgirl";
 const BUNDLE_DIR: &'static str = "bundle";
@@ -26,6 +33,7 @@ pub enum Error {
     LastComponentInvalid(String),
     BundleNotFound,
     BundleMissingMeta,
+    Simple(&'static str),
 }
 
 impl std::convert::From<fs_extra::error::Error> for Error {
@@ -179,7 +187,7 @@ fn cmd_add(env: &Env, bundle_name: &str, paths: &Vec<PathBuf>) -> Result<()> {
     //   - Exclude storage directory
     let paths = paths
         .into_iter()
-        .filter_map(|it| { util::is_symlink(&it).ok().map(|_| it) })
+        .filter(|it| Disk::is_symlink(&it))
         .collect::<Vec<_>>();
 
     let bundle_path = env.storage
@@ -384,8 +392,8 @@ mod tests {
 
         cmd_add(&env, "test_bundle", &paths).expect("Add should have worked");
 
-        assert!(util::is_symlink(config_dir.join("a")).expect("Should be a symlink"));
-        assert!(util::is_symlink(config_dir.join("b")).expect("Should be a symlink"));
+        assert!(Disk::is_symlink(config_dir.join("a")));
+        assert!(Disk::is_symlink(config_dir.join("b")));
 
         println!("should have dir in {}", env.storage.display());
         assert!(env.storage.is_dir());

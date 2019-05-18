@@ -12,3 +12,6 @@ toml = "0.5"
 fs_extra = "^1.1.0"
 dialoguer = "^0.3.0"
 rsfs = "0.4"
+
+[dev-dependencies]
+lazy_static = "1.3"
