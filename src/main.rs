@@ -7,6 +7,8 @@ use clap::{clap_app, AppSettings};
 use serde::{Serialize, Deserialize};
 use dialoguer::{Confirmation, Select, theme};
 
+mod util;
+
 const STORAGE_DIR: &'static str = "dotgirl";
 const BUNDLE_DIR: &'static str = "bundle";
 
@@ -15,7 +17,7 @@ const LOCK_FILE: &'static str = "lock.toml";
 const BUNDLE_FILE: &'static str = "bundle.toml";
 
 #[derive(Debug)]
-enum Error {
+pub enum Error {
     IoError(std::io::Error),
     IoExtraError(fs_extra::error::Error),
     HomedirNotFound,
@@ -167,40 +169,17 @@ fn write_lockfile(env: &Env, lockfile: &Lock) -> Result<()> {
     Ok(())
 }
 
-fn get_name(path: &PathBuf) -> Result<String> {
-    let result = path
-        .components()
-        .last()
-        .ok_or(Error::LastComponentInvalid(
-            String::from(path.to_str().unwrap_or(""))
-        ))?
-        .as_os_str()
-        .to_str()
-        .ok_or(Error::LastComponentInvalid(
-            String::from(path.to_str().unwrap_or(""))
-        ))?
-        .trim_start_matches(".")
-        .to_owned();
-
-    Ok(result)
-}
-
 fn cmd_add(env: &Env, bundle_name: &str, paths: &Vec<PathBuf>) -> Result<()> {
     let mut lockfile = get_lockfile(&env)?;
 
+    // Filter out symlinks
+    // TODO(happens): More validation
+    //   - Check that directories don't contain each other
+    //   - Check for duplicates
+    //   - Exclude storage directory
     let paths = paths
         .into_iter()
-        .filter(|it| {
-            // TODO(happens): More/better validation
-            // Find out if this is a symlink, we want to skip those
-            let meta = fs::symlink_metadata(&it).expect("Failed to get metadata");
-            if meta.file_type().is_symlink() {
-                println!("skipping {} because it is a symlink.", it.to_str().unwrap());
-                return false;
-            }
-
-            true
-        })
+        .filter_map(|it| { util::is_symlink(&it).ok().map(|_| it) })
         .collect::<Vec<_>>();
 
     let bundle_path = env.storage
@@ -217,7 +196,7 @@ fn cmd_add(env: &Env, bundle_name: &str, paths: &Vec<PathBuf>) -> Result<()> {
     let entries = paths
         .iter()
         .map(|remote| {
-            let remote_name = get_name(&remote)?;
+            let remote_name = util::get_name(&remote)?;
             let local = bundle_path.join(remote_name);
 
             if remote.is_dir() {
@@ -327,6 +306,8 @@ fn link(
         let remote_path: PathBuf = it.remote.clone().into();
         let local_path: PathBuf = it.local.clone().into();
 
+        println!("remote path: {}, local path: {}", remote_path.display(), local_path.display());
+
         if let Some(parent) = remote_path.parent() {
             // this is weird, but can happen
             if parent.is_file() {
@@ -371,6 +352,7 @@ fn link(
             // if we drop through to here, we're supposed to nuke it and
             // replace it
             if remote_path.is_dir() {
+                println!("meta: {:?}", std::fs::metadata(&remote_path));
                 fs::remove_dir_all(&remote_path)?;
             } else if remote_path.is_file() {
                 fs::remove_file(&remote_path)?;
@@ -386,30 +368,13 @@ fn link(
 
 #[cfg(test)]
 mod tests {
-    const TEST_ROOT: &'static str = "test_tmp";
     use super::*;
     use std::fs::File;
 
-    #[test]
-    fn get_name_should_work() {
-        // should return directory names
-        let dir_path = PathBuf::from("/foo/bar/baz/");
-        let dir_name = get_name(&dir_path).unwrap();
-        assert_eq!(dir_name, "baz".to_owned());
-
-        // should return file names
-        let file_path = PathBuf::from("/foo/bar/baz.conf");
-        let file_name = get_name(&file_path).unwrap();
-        assert_eq!(file_name, "baz.conf".to_owned());
-
-        // should trim dots at the start
-        let dot_path = PathBuf::from("/foo/bar/.baz.conf");
-        let dot_name = get_name(&dot_path).unwrap();
-        assert_eq!(dot_name, "baz.conf".to_owned());
-    }
+    const TEST_ROOT: &'static str = "test_tmp";
 
     #[test]
-    fn cmd_add_should_work_for_new_bundle() -> Result<()> {
+    fn cmd_add_should_work_for_new_bundle() {
         let (env, config_dir) = setup();
 
         let paths = vec![
@@ -417,13 +382,33 @@ mod tests {
             config_dir.join("b"),
         ];
 
-        cmd_add(&env, "test_bundle", &paths)?;
+        cmd_add(&env, "test_bundle", &paths).expect("Add should have worked");
 
-        // TODO(happens): Add more assertions
+        assert!(util::is_symlink(config_dir.join("a")).expect("Should be a symlink"));
+        assert!(util::is_symlink(config_dir.join("b")).expect("Should be a symlink"));
+
+        println!("should have dir in {}", env.storage.display());
+        assert!(env.storage.is_dir());
 
         clean();
-        Ok(())
     }
+
+    // #[test]
+    // fn cmd_add_should_work_for_existing_bundle() -> Result<()> {
+    //     let (env, config_dir) = setup();
+
+    //     let paths = vec![
+    //         config_dir.join("a"),
+    //         config_dir.join("b"),
+    //     ];
+
+    //     cmd_add(&env, "test_bundle", &paths)?;
+
+    //     assert!(util::is_symlink(config_dir.join("a")).expect("Should be a symlink"));
+
+    //     clean();
+    //     Ok(())
+    // }
 
     // Returns a temp env and a folder with test files
     // ./test_tmp
