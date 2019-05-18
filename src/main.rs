@@ -7,13 +7,20 @@ use clap::{clap_app, AppSettings};
 use serde::{Serialize, Deserialize};
 use dialoguer::{Confirmation, Select, theme};
 
+const STORAGE_DIR: &'static str = "dotgirl";
+const BUNDLE_DIR: &'static str = "bundle";
+
+// const CONFIG_FILE: &'static str = "config.toml";
+const LOCK_FILE: &'static str = "lock.toml";
+const BUNDLE_FILE: &'static str = "bundle.toml";
+
 #[derive(Debug)]
 enum Error {
     IoError(std::io::Error),
     IoExtraError(fs_extra::error::Error),
     HomedirNotFound,
-    ParseError(ron::de::Error),
-    SerializeError(ron::ser::Error),
+    ParseError(toml::de::Error),
+    SerializeError(toml::ser::Error),
     LastComponentInvalid(String),
     BundleNotFound,
     BundleMissingMeta,
@@ -31,34 +38,49 @@ impl std::convert::From<std::io::Error> for Error {
     }
 }
 
-impl std::convert::From<ron::de::Error> for Error {
-    fn from(error: ron::de::Error) -> Self {
+impl std::convert::From<toml::de::Error> for Error {
+    fn from(error: toml::de::Error) -> Self {
         Error::ParseError(error)
     }
 }
 
-impl std::convert::From<ron::ser::Error> for Error {
-    fn from(error: ron::ser::Error) -> Self {
+impl std::convert::From<toml::ser::Error> for Error {
+    fn from(error: toml::ser::Error) -> Self {
         Error::SerializeError(error)
     }
 }
 
 type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Bundle {
     id: String,
-    author: String,
     entries: Vec<Entry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Entry {
-    src: PathBuf,
-    dst: PathBuf,
+    local: String,
+    remote: String,
 }
 
-type Lockfile = Vec<Bundle>;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Lock {
+    bundles: Vec<Bundle>,
+}
+
+#[derive(Debug, Clone)]
+struct Env {
+    storage: PathBuf,
+}
+
+impl Default for Lock {
+    fn default() -> Self {
+        Lock {
+            bundles: vec![],
+        }
+    }
+}
 
 fn main() -> Result<()> {
     let matches = clap_app!(dotgirl =>
@@ -74,9 +96,20 @@ fn main() -> Result<()> {
             (about: "link a bundle")
             (@arg BUNDLE: +required "bundle name")
         )
+        (@subcommand unlink =>
+            (about: "unlink a bundle")
+            (@arg BUNDLE: +required "bundle name")
+        )
     )
         .setting(AppSettings::SubcommandRequiredElseHelp)
         .get_matches();
+
+    // default storage path
+    let storage = dirs::home_dir()
+        .ok_or(Error::HomedirNotFound)?
+        .join(STORAGE_DIR);
+
+    let env = Env { storage };
 
     match matches.subcommand() {
         ("add", Some(matches)) => {
@@ -89,13 +122,13 @@ fn main() -> Result<()> {
                 .map(|it| it.canonicalize().expect("invalid path"))
                 .collect::<Vec<PathBuf>>();
 
-			cmd_add(&bundle, &paths)?;
+			cmd_add(&env, &bundle, &paths)?;
         },
         ("link", Some(matches)) => {
             let bundle = matches.value_of("BUNDLE")
                 .expect("Invalid: BUNDLE is required");
 
-            cmd_link(&bundle)?;
+            cmd_link(&env, &bundle)?;
         },
         _ => {},
     };
@@ -103,60 +136,39 @@ fn main() -> Result<()> {
 	Ok(())
 }
 
-fn get_dir() -> Result<PathBuf> {
-    let mut path = dirs::home_dir().ok_or(Error::HomedirNotFound)?;
-    path.push("dotgirl");
+fn get_storage_dir(env: &Env) -> Result<PathBuf> {
+    let path = env.storage.clone();
     fs::create_dir_all(&path)?;
 
     Ok(path)
 }
 
-fn get_lockfile() -> Result<Lockfile> {
-    let mut path = dirs::home_dir().ok_or(Error::HomedirNotFound)?;
-    path.push("dotgirl");
-
-    if !path.is_dir() {
-        return Ok(vec![]);
-    }
-
-    path.push("lock.ron");
+fn get_lockfile(env: &Env) -> Result<Lock> {
+    let path = env.storage.join(LOCK_FILE);
 
     if !path.is_file() {
-        return Ok(vec![]);
+        return Ok(Default::default());
     }
 
     let contents = fs::read_to_string(path)?;
-    let parsed = ron::de::from_str::<Lockfile>(&contents)?;
+    let parsed = toml::from_str::<Lock>(&contents)?;
 
     Ok(parsed)
 }
 
-fn write_lockfile(lockfile: &Lockfile) -> Result<()> {
-    let mut lock_path = get_dir()?;
-    lock_path.push("lock.ron");
+fn write_lockfile(env: &Env, lockfile: &Lock) -> Result<()> {
+    let mut lock_path = get_storage_dir(&env)?;
+    lock_path.push(LOCK_FILE);
 
-    let lockfile_ser = ron::ser::to_string(&lockfile)?;
+    let lockfile_ser = toml::to_string(&lockfile)?;
     let mut out = File::create(lock_path)?;
     out.write_all(lockfile_ser.as_bytes())?;
 
     Ok(())
 }
 
-fn get_bundle_dir(name: &str, create: bool) -> Result<PathBuf> {
-    let mut path = dirs::home_dir().ok_or(Error::HomedirNotFound)?;
-    path.push("dotgirl");
-    path.push("bundle");
-    path.push(name);
-
-    if create {
-        fs::create_dir_all(&path)?;
-    }
-
-    Ok(path)
-}
-
-fn get_last(path: &PathBuf) -> Result<String> {
-    let last = path
+fn get_name(path: &PathBuf) -> Result<String> {
+    let result = path
         .components()
         .last()
         .ok_or(Error::LastComponentInvalid(
@@ -166,13 +178,15 @@ fn get_last(path: &PathBuf) -> Result<String> {
         .to_str()
         .ok_or(Error::LastComponentInvalid(
             String::from(path.to_str().unwrap_or(""))
-        ))?;
+        ))?
+        .trim_start_matches(".")
+        .to_owned();
 
-    Ok(String::from(last))
+    Ok(result)
 }
 
-fn cmd_add(bundle_name: &str, paths: &Vec<PathBuf>) -> Result<()> {
-    let mut lockfile = get_lockfile()?;
+fn cmd_add(env: &Env, bundle_name: &str, paths: &Vec<PathBuf>) -> Result<()> {
+    let mut lockfile = get_lockfile(&env)?;
 
     let paths = paths
         .into_iter()
@@ -189,34 +203,46 @@ fn cmd_add(bundle_name: &str, paths: &Vec<PathBuf>) -> Result<()> {
         })
         .collect::<Vec<_>>();
 
-    let dir = get_bundle_dir(bundle_name, true)?;
+    let bundle_path = env.storage
+        .join("bundle")
+        .join(bundle_name);
+
+    if bundle_path.is_dir() {
+        println!("adding to existing bundle `{}`", bundle_name);
+    } else {
+        println!("creating bundle `{}`", bundle_name);
+        fs::create_dir_all(&bundle_path)?;
+    }
+
     let entries = paths
         .iter()
-        .map(|dst| {
-            let dst = dst.to_path_buf();
+        .map(|remote| {
+            let remote_name = get_name(&remote)?;
+            let local = bundle_path.join(remote_name);
 
-            let mut src = dir.to_path_buf();
-            let src_last = get_last(&src)?;
-            let mut src_last = String::from(src_last);
-            if src_last.starts_with(".") {
-                src_last.remove(0);
-            }
-
-            src.push(src_last);
-
-            if dst.is_dir() {
+            if remote.is_dir() {
                 let mut options = fs_extra::dir::CopyOptions::new();
-                options.copy_inside = false;
+                options.copy_inside = true;
                 options.overwrite = true;
-                fs::create_dir_all(&src)?;
-                fs_extra::dir::copy(&dst, &src, &options)?;
-            } else if dst.is_file() {
-                fs::copy(&dst, &src)?;
+
+                fs_extra::dir::copy(&remote, &local, &options)?;
+            } else if remote.is_file() {
+                fs::copy(&remote, &local)?;
             } else {
-                println!("Does not exist: {:?}", src);
+                println!("Does not exist: {:?}", remote);
             }
 
-            Ok(Entry { src, dst })
+            let local = local
+                .to_str()
+                .expect("Invalid: paths should be UTF-8")
+                .to_owned();
+
+            let remote = remote
+                .to_str()
+                .expect("Invalid: paths should be UTF-8")
+                .to_owned();
+
+            Ok(Entry { local, remote })
         })
         .map(|it| {
             if it.is_err() {
@@ -230,14 +256,13 @@ fn cmd_add(bundle_name: &str, paths: &Vec<PathBuf>) -> Result<()> {
 
     let bundle = Bundle {
         id: String::from(bundle_name),
-        author: String::from("me"),
         entries,
     };
 
     // Save the dotfile for the bundle itself, this has all the paths
-    let dot_meta_path = dir.join("dot.ron");
+    let dot_meta_path = bundle_path.join(BUNDLE_FILE);
 
-    let bundle_ser = ron::ser::to_string(&bundle)?;
+    let bundle_ser = toml::to_string(&bundle)?;
     let mut out = File::create(dot_meta_path)?;
     out.write_all(bundle_ser.as_bytes())?;
 
@@ -245,42 +270,42 @@ fn cmd_add(bundle_name: &str, paths: &Vec<PathBuf>) -> Result<()> {
     // been linked successfully (which in this case should always be
     // all of them, but still)
     let linked = link(&bundle, &[], true)?;
-    lockfile.push(Bundle { entries: linked, ..bundle });
-    write_lockfile(&lockfile)?;
+    lockfile.bundles.push(Bundle { entries: linked, ..bundle });
+    write_lockfile(&env, &lockfile)?;
 
     Ok(())
 }
 
-fn cmd_link(bundle_name: &str) -> Result<()> {
-    let mut lockfile = get_lockfile()?;
+fn cmd_link(env: &Env, bundle_name: &str) -> Result<()> {
+    let mut lockfile = get_lockfile(&env)?;
 
-    let maybe_previous = lockfile.iter().find(|it| it.id == bundle_name);
+    let maybe_previous = lockfile.bundles.iter().find(|it| it.id == bundle_name);
     let previous_entries = if let Some(previous) = maybe_previous {
         previous.entries
             .iter()
-            .map(|it| it.dst.to_str().unwrap())
+            .map(|it| it.remote.as_ref())
             .collect::<Vec<_>>()
     } else {
         vec![]
     };
 
-    let dir = get_bundle_dir(bundle_name, false)?;
+    let dir = env.storage.join(BUNDLE_DIR).join(bundle_name);
     if !dir.exists() || !dir.is_dir() {
         return Err(Error::BundleNotFound);
     }
 
-    let dot_meta_path = dir.join("dot.ron");
+    let dot_meta_path = dir.join(BUNDLE_FILE);
     if !dot_meta_path.exists() || !dot_meta_path.is_file() {
         return Err(Error::BundleMissingMeta);
     }
 
     let contents = fs::read_to_string(dot_meta_path)?;
-    let bundle = ron::de::from_str::<Bundle>(&contents)?;
+    let bundle = toml::from_str::<Bundle>(&contents)?;
 
     let linked = link(&bundle, &previous_entries[..], false)?;
-    lockfile.retain(|it| it.id != bundle_name);
-    lockfile.push(Bundle { entries: linked, ..bundle });
-    write_lockfile(&lockfile)?;
+    lockfile.bundles.retain(|it| it.id != bundle_name);
+    lockfile.bundles.push(Bundle { entries: linked, ..bundle });
+    write_lockfile(&env, &lockfile)?;
 
     Ok(())
 }
@@ -290,6 +315,7 @@ fn link(
     overwrite: &[&str],
     overwrite_all: bool
 ) -> Result<Vec<Entry>> {
+    // TODO(happens): Check if linked bundles conflict with this one
     use std::os::unix::fs::symlink;
 
     let mut result = Vec::new();
@@ -297,13 +323,16 @@ fn link(
     for it in &bundle.entries {
         // first, make sure that all dirs leading up to the file
         // or dir exist (if there is no parent that means we
-        // are placing the file at '/', which is fine
-        if let Some(parent) = it.dst.parent() {
+        // are placing the file at '/', which is fine, i guess?)
+        let remote_path: PathBuf = it.remote.clone().into();
+        let local_path: PathBuf = it.local.clone().into();
+
+        if let Some(parent) = remote_path.parent() {
             // this is weird, but can happen
             if parent.is_file() {
                 let text = format!(
                     "You're trying to link the file {}, but {} is a file. {}",
-                    it.dst.display(), parent.display(),
+                    it.remote, parent.display(),
                     "Do you want to overwrite the file and create a directory instead?",
                 );
 
@@ -322,11 +351,11 @@ fn link(
             }
         }
 
-        if it.dst.exists() {
-            if !overwrite_all && !overwrite.contains(&it.dst.to_str().unwrap()) {
+        if remote_path.exists() {
+            if !overwrite_all && !overwrite.contains(&it.remote.as_ref()) {
                 let choices = &["skip", "overwrite", "overwrite all"];
                 let selection = Select::with_theme(&theme::ColorfulTheme::default())
-                    .with_prompt(&format!("{} already exists.", it.dst.display()))
+                    .with_prompt(&format!("{} already exists.", it.remote))
                     .default(0)
                     .items(&choices[..])
                     .interact()
@@ -341,17 +370,108 @@ fn link(
 
             // if we drop through to here, we're supposed to nuke it and
             // replace it
-            if it.dst.is_dir() {
-                fs::remove_dir_all(&it.dst)?;
-            } else if it.dst.is_file() {
-                fs::remove_file(&it.dst)?;
+            if remote_path.is_dir() {
+                fs::remove_dir_all(&remote_path)?;
+            } else if remote_path.is_file() {
+                fs::remove_file(&remote_path)?;
             }
         }
 
-        symlink(&it.src, &it.dst)?;
+        symlink(&local_path, &remote_path)?;
         result.push(it.clone());
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    const TEST_ROOT: &'static str = "test_tmp";
+    use super::*;
+    use std::fs::File;
+
+    #[test]
+    fn get_name_should_work() {
+        // should return directory names
+        let dir_path = PathBuf::from("/foo/bar/baz/");
+        let dir_name = get_name(&dir_path).unwrap();
+        assert_eq!(dir_name, "baz".to_owned());
+
+        // should return file names
+        let file_path = PathBuf::from("/foo/bar/baz.conf");
+        let file_name = get_name(&file_path).unwrap();
+        assert_eq!(file_name, "baz.conf".to_owned());
+
+        // should trim dots at the start
+        let dot_path = PathBuf::from("/foo/bar/.baz.conf");
+        let dot_name = get_name(&dot_path).unwrap();
+        assert_eq!(dot_name, "baz.conf".to_owned());
+    }
+
+    #[test]
+    fn cmd_add_should_work_for_new_bundle() -> Result<()> {
+        let (env, config_dir) = setup();
+
+        let paths = vec![
+            config_dir.join("a"),
+            config_dir.join("b"),
+        ];
+
+        cmd_add(&env, "test_bundle", &paths)?;
+
+        // TODO(happens): Add more assertions
+
+        clean();
+        Ok(())
+    }
+
+    // Returns a temp env and a folder with test files
+    // ./test_tmp
+    //     /dotgirl (storage dir)
+    //     /config
+    //         /a
+    //             /sub
+    //                 config
+    //             config
+    //         /b
+    //             config
+    //
+    fn setup() -> (Env, PathBuf) {
+        let mut tmp = std::env::current_dir().expect("No current dir");
+        tmp.push(TEST_ROOT);
+
+        let storage = tmp.join(STORAGE_DIR);
+        fs::create_dir_all(&storage).expect("Could not create storage dir");
+
+        let conf = tmp.join("config");
+
+        let conf_a = conf.join("a");
+        let conf_a_sub = conf_a.join("sub");
+        fs::create_dir_all(&conf_a_sub).expect("Could not create test dir");
+
+        let mut conf_a_file = File::create(conf_a.join("config"))
+            .expect("Could not create test file");
+        conf_a_file.write_all(b"hello config")
+            .expect("Could not write to test file");
+        let mut conf_a_sub_file = File::create(conf_a_sub.join("config"))
+            .expect("Could not create test file");
+        conf_a_sub_file.write_all(b"hello config")
+            .expect("Could not write to test file");
+
+        let conf_b = conf.join("b");
+        fs::create_dir_all(&conf_b).expect("Could not create test dir");
+        let mut conf_b_file = File::create(conf_b.join("config"))
+            .expect("Could not create test file");
+        conf_b_file.write_all(b"hello config")
+            .expect("Could not write to test file");
+
+        (Env { storage }, conf)
+    }
+
+    fn clean() {
+        let mut tmp = std::env::current_dir().expect("No current dir");
+        tmp.push(TEST_ROOT);
+        fs::remove_dir_all(&tmp).expect("Couldn't clean up test root");
+    }
 }
 
