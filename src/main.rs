@@ -1,12 +1,4 @@
-#[cfg(test)]
-#[macro_use]
-extern crate lazy_static;
-
-use std::{
-    io::Write,
-    fs::{self, File},
-    path::{Path, PathBuf}
-};
+use std::path::{Path, PathBuf};
 use clap::{clap_app, AppSettings};
 use serde::{Serialize, Deserialize};
 use dialoguer::{Confirmation, Select, theme};
@@ -148,7 +140,7 @@ fn main() -> Result<()> {
 
 fn get_storage_dir(env: &Env) -> Result<PathBuf> {
     let path = env.storage.clone();
-    fs::create_dir_all(&path)?;
+    Disk::mkdir_all(&env.storage)?;
 
     Ok(path)
 }
@@ -156,11 +148,11 @@ fn get_storage_dir(env: &Env) -> Result<PathBuf> {
 fn get_lockfile(env: &Env) -> Result<Lock> {
     let path = env.storage.join(LOCK_FILE);
 
-    if !path.is_file() {
+    if !Disk::is_file(&path) {
         return Ok(Default::default());
     }
 
-    let contents = fs::read_to_string(path)?;
+    let contents = Disk::get(path)?;
     let parsed = toml::from_str::<Lock>(&contents)?;
 
     Ok(parsed)
@@ -170,9 +162,8 @@ fn write_lockfile(env: &Env, lockfile: &Lock) -> Result<()> {
     let mut lock_path = get_storage_dir(&env)?;
     lock_path.push(LOCK_FILE);
 
-    let lockfile_ser = toml::to_string(&lockfile)?;
-    let mut out = File::create(lock_path)?;
-    out.write_all(lockfile_ser.as_bytes())?;
+    let ser = toml::to_string(&lockfile)?;
+    Disk::put(&lock_path, &ser)?;
 
     Ok(())
 }
@@ -187,7 +178,7 @@ fn cmd_add(env: &Env, bundle_name: &str, paths: &Vec<PathBuf>) -> Result<()> {
     //   - Exclude storage directory
     let paths = paths
         .into_iter()
-        .filter(|it| Disk::is_symlink(&it))
+        .filter(|it| !Disk::is_symlink(&it))
         .collect::<Vec<_>>();
 
     let bundle_path = env.storage
@@ -198,7 +189,7 @@ fn cmd_add(env: &Env, bundle_name: &str, paths: &Vec<PathBuf>) -> Result<()> {
         println!("adding to existing bundle `{}`", bundle_name);
     } else {
         println!("creating bundle `{}`", bundle_name);
-        fs::create_dir_all(&bundle_path)?;
+        Disk::mkdir_all(&bundle_path)?;
     }
 
     let entries = paths
@@ -207,39 +198,18 @@ fn cmd_add(env: &Env, bundle_name: &str, paths: &Vec<PathBuf>) -> Result<()> {
             let remote_name = util::get_name(&remote)?;
             let local = bundle_path.join(remote_name);
 
-            if remote.is_dir() {
-                let mut options = fs_extra::dir::CopyOptions::new();
-                options.copy_inside = true;
-                options.overwrite = true;
+            Disk::copy(&remote, &local)?;
+            Disk::remove(&remote)?;
 
-                fs_extra::dir::copy(&remote, &local, &options)?;
-            } else if remote.is_file() {
-                fs::copy(&remote, &local)?;
-            } else {
-                println!("Does not exist: {:?}", remote);
-            }
-
-            let local = local
-                .to_str()
-                .expect("Invalid: paths should be UTF-8")
-                .to_owned();
-
-            let remote = remote
-                .to_str()
-                .expect("Invalid: paths should be UTF-8")
-                .to_owned();
+            let local = format!("{}", local.display());
+            let remote = format!("{}", remote.display());
 
             Ok(Entry { local, remote })
         })
-        .map(|it| {
-            if it.is_err() {
-                println!("err while adding: {:?}", it);
-            }
-
-            it
-        })
         .filter_map(Result::ok)
         .collect::<Vec<Entry>>();
+
+    // TODO(happens): Report on skipped
 
     let bundle = Bundle {
         id: String::from(bundle_name),
@@ -249,9 +219,8 @@ fn cmd_add(env: &Env, bundle_name: &str, paths: &Vec<PathBuf>) -> Result<()> {
     // Save the dotfile for the bundle itself, this has all the paths
     let dot_meta_path = bundle_path.join(BUNDLE_FILE);
 
-    let bundle_ser = toml::to_string(&bundle)?;
-    let mut out = File::create(dot_meta_path)?;
-    out.write_all(bundle_ser.as_bytes())?;
+    let ser = toml::to_string(&bundle)?;
+    Disk::put(&dot_meta_path, &ser)?;
 
     // Save the new dotfile, which contains only the paths that have
     // been linked successfully (which in this case should always be
@@ -277,16 +246,16 @@ fn cmd_link(env: &Env, bundle_name: &str) -> Result<()> {
     };
 
     let dir = env.storage.join(BUNDLE_DIR).join(bundle_name);
-    if !dir.exists() || !dir.is_dir() {
+    if !Disk::is_dir(&dir) {
         return Err(Error::BundleNotFound);
     }
 
     let dot_meta_path = dir.join(BUNDLE_FILE);
-    if !dot_meta_path.exists() || !dot_meta_path.is_file() {
+    if !Disk::is_file(&dot_meta_path) {
         return Err(Error::BundleMissingMeta);
     }
 
-    let contents = fs::read_to_string(dot_meta_path)?;
+    let contents = Disk::get(&dot_meta_path)?;
     let bundle = toml::from_str::<Bundle>(&contents)?;
 
     let linked = link(&bundle, &previous_entries[..], false)?;
@@ -303,7 +272,6 @@ fn link(
     overwrite_all: bool
 ) -> Result<Vec<Entry>> {
     // TODO(happens): Check if linked bundles conflict with this one
-    use std::os::unix::fs::symlink;
 
     let mut result = Vec::new();
     let mut overwrite_all = overwrite_all;
@@ -314,11 +282,9 @@ fn link(
         let remote_path: PathBuf = it.remote.clone().into();
         let local_path: PathBuf = it.local.clone().into();
 
-        println!("remote path: {}, local path: {}", remote_path.display(), local_path.display());
-
         if let Some(parent) = remote_path.parent() {
             // this is weird, but can happen
-            if parent.is_file() {
+            if Disk::is_file(&parent) {
                 let text = format!(
                     "You're trying to link the file {}, but {} is a file. {}",
                     it.remote, parent.display(),
@@ -331,12 +297,12 @@ fn link(
                     .interact()
                     .expect("Failed to show prompt")
                 {
-                    fs::remove_file(parent)?;
+                    Disk::remove(&parent)?;
                 }
             }
 
             if !parent.is_dir() {
-                fs::create_dir_all(parent)?;
+                Disk::mkdir_all(&parent)?;
             }
         }
 
@@ -359,15 +325,10 @@ fn link(
 
             // if we drop through to here, we're supposed to nuke it and
             // replace it
-            if remote_path.is_dir() {
-                println!("meta: {:?}", std::fs::metadata(&remote_path));
-                fs::remove_dir_all(&remote_path)?;
-            } else if remote_path.is_file() {
-                fs::remove_file(&remote_path)?;
-            }
+            Disk::remove(&remote_path)?;
         }
 
-        symlink(&local_path, &remote_path)?;
+        Disk::symlink(&local_path, &remote_path)?;
         result.push(it.clone());
     }
 
@@ -377,9 +338,6 @@ fn link(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
-
-    const TEST_ROOT: &'static str = "test_tmp";
 
     #[test]
     fn cmd_add_should_work_for_new_bundle() {
@@ -392,79 +350,81 @@ mod tests {
 
         cmd_add(&env, "test_bundle", &paths).expect("Add should have worked");
 
+        Disk::print();
+
         assert!(Disk::is_symlink(config_dir.join("a")));
         assert!(Disk::is_symlink(config_dir.join("b")));
 
-        println!("should have dir in {}", env.storage.display());
-        assert!(env.storage.is_dir());
+        let bundle_dir = env.storage.join("bundle/test_bundle");
+
+        assert!(Disk::is_dir(bundle_dir.join("a")));
+        assert!(Disk::is_dir(bundle_dir.join("a/sub")));
+        assert!(Disk::is_dir(bundle_dir.join("b")));
+
+        assert!(Disk::is_file(bundle_dir.join("a/config")));
+        assert!(Disk::is_file(bundle_dir.join("a/sub/config")));
+        assert!(Disk::is_file(bundle_dir.join("a/.hidden-config")));
 
         clean();
     }
 
-    // #[test]
-    // fn cmd_add_should_work_for_existing_bundle() -> Result<()> {
-    //     let (env, config_dir) = setup();
+    #[test]
+    fn cmd_add_should_trim_dot_prefix() {
+        let (env, config_dir) = setup();
+        let paths = vec![config_dir.join(".hidden-config")];
 
-    //     let paths = vec![
-    //         config_dir.join("a"),
-    //         config_dir.join("b"),
-    //     ];
+        cmd_add(&env, "test_bundle", &paths).expect("Add should have worked");
 
-    //     cmd_add(&env, "test_bundle", &paths)?;
+        Disk::print();
 
-    //     assert!(util::is_symlink(config_dir.join("a")).expect("Should be a symlink"));
+        assert!(Disk::is_symlink(config_dir.join(".hidden-config")));
+        assert!(Disk::is_file(env.storage.join("bundle/test_bundle/hidden-config")));
 
-    //     clean();
-    //     Ok(())
-    // }
+        clean();
+    }
 
     // Returns a temp env and a folder with test files
     // ./test_tmp
     //     /dotgirl (storage dir)
     //     /config
+    //         config
+    //         .hidden-config
     //         /a
     //             /sub
     //                 config
+    //                 .hidden-config
     //             config
     //         /b
     //             config
     //
     fn setup() -> (Env, PathBuf) {
-        let mut tmp = std::env::current_dir().expect("No current dir");
-        tmp.push(TEST_ROOT);
+        let root = PathBuf::from("/");
 
-        let storage = tmp.join(STORAGE_DIR);
-        fs::create_dir_all(&storage).expect("Could not create storage dir");
+        let storage = root.join(STORAGE_DIR);
+        Disk::mkdir_all(&storage).unwrap();
 
-        let conf = tmp.join("config");
+        let conf = root.join("config");
 
         let conf_a = conf.join("a");
         let conf_a_sub = conf_a.join("sub");
-        fs::create_dir_all(&conf_a_sub).expect("Could not create test dir");
+        Disk::mkdir_all(&conf_a_sub).unwrap();
 
-        let mut conf_a_file = File::create(conf_a.join("config"))
-            .expect("Could not create test file");
-        conf_a_file.write_all(b"hello config")
-            .expect("Could not write to test file");
-        let mut conf_a_sub_file = File::create(conf_a_sub.join("config"))
-            .expect("Could not create test file");
-        conf_a_sub_file.write_all(b"hello config")
-            .expect("Could not write to test file");
+        Disk::put(conf.join("config"), "hello config").unwrap();
+        Disk::put(conf.join(".hidden-config"), "hello config").unwrap();
+
+        Disk::put(conf_a.join("config"), "hello config").unwrap();
+        Disk::put(conf_a.join(".hidden-config"), "hello config").unwrap();
+        Disk::put(conf_a_sub.join("config"), "hello config").unwrap();
 
         let conf_b = conf.join("b");
-        fs::create_dir_all(&conf_b).expect("Could not create test dir");
-        let mut conf_b_file = File::create(conf_b.join("config"))
-            .expect("Could not create test file");
-        conf_b_file.write_all(b"hello config")
-            .expect("Could not write to test file");
+        Disk::mkdir_all(&conf_b).unwrap();
+        Disk::put(conf_b.join("config"), "hello config").unwrap();
 
         (Env { storage }, conf)
     }
 
     fn clean() {
-        let mut tmp = std::env::current_dir().expect("No current dir");
-        tmp.push(TEST_ROOT);
-        fs::remove_dir_all(&tmp).expect("Couldn't clean up test root");
+        Disk::clear();
     }
 }
 
