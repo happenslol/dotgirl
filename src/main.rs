@@ -67,8 +67,13 @@ struct Entry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct Linked {
+    id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Lock {
-    bundles: Vec<Bundle>,
+    linked: Vec<Linked>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,7 +84,7 @@ struct Env {
 impl Default for Lock {
     fn default() -> Self {
         Lock {
-            bundles: vec![],
+            linked: vec![],
         }
     }
 }
@@ -225,8 +230,8 @@ fn cmd_add(env: &Env, bundle_name: &str, paths: &Vec<PathBuf>) -> Result<()> {
     // Save the new dotfile, which contains only the paths that have
     // been linked successfully (which in this case should always be
     // all of them, but still)
-    let linked = link(&bundle, &[], true)?;
-    lockfile.bundles.push(Bundle { entries: linked, ..bundle });
+    let _ = link(&bundle, &[], true)?;
+    lockfile.linked.push(Linked { id: bundle.id.clone() });
     write_lockfile(&env, &lockfile)?;
 
     Ok(())
@@ -235,15 +240,7 @@ fn cmd_add(env: &Env, bundle_name: &str, paths: &Vec<PathBuf>) -> Result<()> {
 fn cmd_link(env: &Env, bundle_name: &str) -> Result<()> {
     let mut lockfile = get_lockfile(&env)?;
 
-    let maybe_previous = lockfile.bundles.iter().find(|it| it.id == bundle_name);
-    let previous_entries = if let Some(previous) = maybe_previous {
-        previous.entries
-            .iter()
-            .map(|it| it.remote.as_ref())
-            .collect::<Vec<_>>()
-    } else {
-        vec![]
-    };
+    // TODO(happens): Confirm if already linked
 
     let dir = env.storage.join(BUNDLE_DIR).join(bundle_name);
     if !Disk::is_dir(&dir) {
@@ -255,12 +252,11 @@ fn cmd_link(env: &Env, bundle_name: &str) -> Result<()> {
         return Err(Error::BundleMissingMeta);
     }
 
-    let contents = Disk::get(&dot_meta_path)?;
-    let bundle = toml::from_str::<Bundle>(&contents)?;
+    let raw = Disk::get(&dot_meta_path)?;
+    let bundle = toml::from_str::<Bundle>(&raw)?;
 
-    let linked = link(&bundle, &previous_entries[..], false)?;
-    lockfile.bundles.retain(|it| it.id != bundle_name);
-    lockfile.bundles.push(Bundle { entries: linked, ..bundle });
+    let _ = link(&bundle, &[], false)?;
+    lockfile.linked.push(Linked { id: bundle.id.clone() });
     write_lockfile(&env, &lockfile)?;
 
     Ok(())
@@ -342,6 +338,7 @@ mod tests {
     #[test]
     fn cmd_add_should_work_for_new_bundle() {
         let (env, config_dir) = setup();
+        let bundle_dir = env.storage.join("bundle/test_bundle");
 
         let paths = vec![
             config_dir.join("a"),
@@ -355,7 +352,7 @@ mod tests {
         assert!(Disk::is_symlink(config_dir.join("a")));
         assert!(Disk::is_symlink(config_dir.join("b")));
 
-        let bundle_dir = env.storage.join("bundle/test_bundle");
+        assert!(Disk::is_file(bundle_dir.join("bundle.toml")));
 
         assert!(Disk::is_dir(bundle_dir.join("a")));
         assert!(Disk::is_dir(bundle_dir.join("a/sub")));
@@ -364,6 +361,32 @@ mod tests {
         assert!(Disk::is_file(bundle_dir.join("a/config")));
         assert!(Disk::is_file(bundle_dir.join("a/sub/config")));
         assert!(Disk::is_file(bundle_dir.join("a/.hidden-config")));
+
+        clean();
+    }
+
+    #[test]
+    fn cmd_add_should_work_for_existing_bundle() {
+        let (env, config_dir) = setup();
+        let bundle_dir = env.storage.join("bundle/test_bundle");
+
+        // create bundle
+        let paths = vec![config_dir.join("a")];
+        cmd_add(&env, "test_bundle", &paths).expect("Add should have worked");
+        println!("printing disk after first add");
+        Disk::print();
+
+        assert!(Disk::is_symlink(config_dir.join("a")));
+        assert!(Disk::is_dir(bundle_dir.join("a")));
+
+        // add to bundle
+        let paths = vec![config_dir.join("b")];
+        cmd_add(&env, "test_bundle", &paths).expect("Add should have worked");
+        println!("printing disk after second add");
+        Disk::print();
+
+        assert!(Disk::is_symlink(config_dir.join("b")));
+        assert!(Disk::is_dir(bundle_dir.join("b")));
 
         clean();
     }
